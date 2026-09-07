@@ -9,6 +9,11 @@ const {
 } = require("discord.js");
 
 const { InferenceClient } = require("@huggingface/inference");
+const Database = require("better-sqlite3");
+
+// ========================================
+// ⚙️ CONFIGURAÇÃO
+// ========================================
 
 const client = new Client({
     intents: [
@@ -21,41 +26,74 @@ const client = new Client({
 const hf = new InferenceClient(process.env.HF_TOKEN);
 
 // ========================================
-// 🧠 MEMÓRIA
+// 🧠 BANCO DE DADOS
 // ========================================
 
-const memories = new Map();
+const db = new Database("carbot.db");
+
+db.prepare(`
+    CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+`).run();
+
+// Mantém somente as últimas 10 mensagens por usuário
+function saveMemory(userId, role, content) {
+    db.prepare(`
+        INSERT INTO memories (user_id, role, content)
+        VALUES (?, ?, ?)
+    `).run(userId, role, content);
+
+    const count = db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM memories
+        WHERE user_id = ?
+    `).get(userId).count;
+
+    if (count > 10) {
+        db.prepare(`
+            DELETE FROM memories
+            WHERE user_id = ?
+            AND id NOT IN (
+                SELECT id
+                FROM memories
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 10
+            )
+        `).run(userId, userId);
+    }
+}
 
 function getMemory(userId) {
-    if (!memories.has(userId)) {
-        memories.set(userId, []);
-    }
-
-    return memories.get(userId);
+    return db.prepare(`
+        SELECT role, content
+        FROM memories
+        WHERE user_id = ?
+        ORDER BY id ASC
+        LIMIT 10
+    `).all(userId);
 }
 
-function addToMemory(userId, role, content) {
-    const memory = getMemory(userId);
-
-    memory.push({
-        role,
-        content
-    });
-
-    // Mantém somente as últimas 10 mensagens
-    if (memory.length > 10) {
-        memory.shift();
-    }
+function clearMemory(userId) {
+    db.prepare(`
+        DELETE FROM memories
+        WHERE user_id = ?
+    `).run(userId);
 }
 
 // ========================================
-// 🤖 IA
+// 🤖 INTELIGÊNCIA ARTIFICIAL
 // ========================================
 
 async function askAI(userId, prompt) {
-    const memory = getMemory(userId);
+    saveMemory(userId, "user", prompt);
 
-    addToMemory(userId, "user", prompt);
+    const memory = getMemory(userId);
 
     const response = await hf.chatCompletion({
         model: "openai/gpt-oss-120b:fastest",
@@ -63,11 +101,16 @@ async function askAI(userId, prompt) {
         messages: [
             {
                 role: "system",
-                content:
-                    "Você é o Carbot, um bot brasileiro de Discord. " +
-                    "Responda sempre em português, de forma amigável, útil e descontraída. " +
-                    "Você pode usar emojis quando fizer sentido." +
-                    "O seu criador é o longhorn2004 (<@1417274590937223168>)"
+                content: `
+Você é o Carbot, um bot brasileiro de Discord.
+
+Responda sempre em português, de forma amigável,
+útil e descontraída.
+
+Você pode usar emojis quando fizer sentido.
+
+Seu criador é o longhorn2004 (<@1417274590937223168>).
+`
             },
 
             ...memory
@@ -84,13 +127,13 @@ async function askAI(userId, prompt) {
         throw new Error("A IA não retornou uma resposta.");
     }
 
-    addToMemory(userId, "assistant", answer);
+    saveMemory(userId, "assistant", answer);
 
     return answer;
 }
 
 // ========================================
-// ⚙️ SLASH COMMANDS
+// ⚡ COMANDOS
 // ========================================
 
 const commands = [
@@ -106,7 +149,11 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("ping")
-        .setDescription("Verifica se o Carbot está online")
+        .setDescription("Verifica se o Carbot está online"),
+
+    new SlashCommandBuilder()
+        .setName("clear")
+        .setDescription("Apaga sua memória de conversa com o Carbot")
 ].map(command => command.toJSON());
 
 // ========================================
@@ -128,6 +175,7 @@ client.once("ready", async () => {
         );
 
         console.log("✅ Comandos slash registrados!");
+        console.log("🧠 Memória SQLite carregada!");
     } catch (error) {
         console.error(
             "❌ Erro ao registrar comandos:",
@@ -143,12 +191,10 @@ client.once("ready", async () => {
 client.on("messageCreate", async message => {
     if (message.author.bot) return;
 
-    // Ping tradicional
     if (message.content.toLowerCase() === "ping") {
         return message.reply("🏓 Pong!");
     }
 
-    // Só responde quando for mencionado
     if (!message.mentions.has(client.user)) return;
 
     const prompt = message.content
@@ -188,10 +234,21 @@ client.on("messageCreate", async message => {
 client.on("interactionCreate", async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
+    // /ping
     if (interaction.commandName === "ping") {
         return interaction.reply("🏓 Pong!");
     }
 
+    // /clear
+    if (interaction.commandName === "clear") {
+        clearMemory(interaction.user.id);
+
+        return interaction.reply(
+            "🧠 Memória apagada! Começamos do zero."
+        );
+    }
+
+    // /ask
     if (interaction.commandName === "ask") {
         const prompt =
             interaction.options.getString("pergunta");

@@ -1,8 +1,9 @@
 {
   "dependencies": {
+    "@huggingface/inference": "^4.13.0",
+    "better-sqlite3": "^13.0.3",
     "discord.js": "^14.27.0",
-    "dotenv": "^17.4.2",
-    "@huggingface/inference": "^4.13.0"
+    "dotenv": "^17.4.2"
   },
   "name": "carbot",
   "version": "1.0.0",
