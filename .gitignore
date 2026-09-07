@@ -1,4 +1,11 @@
 node_modules/
 .env
+.env.*
+!.env.example
+
 carbot.db
+*.db
+*.log
+
+npm-debug.log*
 Bash.bat

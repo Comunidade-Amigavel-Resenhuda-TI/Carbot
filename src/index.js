@@ -1,18 +1,171 @@
+// ========================================
+// 🤖 CARBOT 1.2.1
+// Compatível com Wispbyte
+// ========================================
+
 require("dotenv").config();
+
+const fs = require("node:fs");
+const path = require("node:path");
 
 const {
     Client,
     GatewayIntentBits,
     REST,
     Routes,
-    SlashCommandBuilder
+    SlashCommandBuilder,
+    PermissionFlagsBits,
+    EmbedBuilder
 } = require("discord.js");
 
 const { InferenceClient } = require("@huggingface/inference");
-const Database = require("better-sqlite3");
+
+const {
+    splitMessage,
+    getAIErrorMessage,
+    normalizeHFError,
+    defaultPersonality
+} = require("./utils");
 
 // ========================================
-// ⚙️ CONFIGURAÇÃO
+// ⚙️ CONFIGURAÇÕES
+// ========================================
+
+const MODEL =
+    process.env.HF_MODEL ||
+    "openai/gpt-oss-120b:fastest";
+
+const MAX_MEMORY = 10;
+
+// ========================================
+// 💾 BANCO JSON
+// ========================================
+
+const dataDir = path.join(__dirname, "..", "data");
+const dataFile = path.join(dataDir, "carbot.json");
+
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+}
+
+if (!fs.existsSync(dataFile)) {
+    fs.writeFileSync(
+        dataFile,
+        JSON.stringify({
+            memories: {},
+            guilds: {}
+        }, null, 2)
+    );
+}
+
+function loadData() {
+    try {
+        const content = fs.readFileSync(dataFile, "utf8");
+
+        const data = JSON.parse(content);
+
+        if (!data.memories) {
+            data.memories = {};
+        }
+
+        if (!data.guilds) {
+            data.guilds = {};
+        }
+
+        return data;
+    } catch (error) {
+        console.error("❌ Erro ao ler carbot.json:", error);
+
+        return {
+            memories: {},
+            guilds: {}
+        };
+    }
+}
+
+let db = loadData();
+
+function saveData() {
+    try {
+        fs.writeFileSync(
+            dataFile,
+            JSON.stringify(db, null, 2)
+        );
+    } catch (error) {
+        console.error("❌ Erro ao salvar carbot.json:", error);
+    }
+}
+
+// ========================================
+// 🧠 MEMÓRIA
+// ========================================
+
+function getMemory(guildId, userId) {
+    const key = `${guildId}:${userId}`;
+
+    return db.memories[key] || [];
+}
+
+function saveMemory(guildId, userId, role, content) {
+    const key = `${guildId}:${userId}`;
+
+    if (!db.memories[key]) {
+        db.memories[key] = [];
+    }
+
+    db.memories[key].push({
+        role,
+        content,
+        created_at: new Date().toISOString()
+    });
+
+    if (db.memories[key].length > MAX_MEMORY) {
+        db.memories[key] =
+            db.memories[key].slice(-MAX_MEMORY);
+    }
+
+    saveData();
+}
+
+function clearMemory(guildId, userId) {
+    const key = `${guildId}:${userId}`;
+
+    delete db.memories[key];
+
+    saveData();
+}
+
+// ========================================
+// 🏠 CONFIGURAÇÃO DO SERVIDOR
+// ========================================
+
+function getPersonality(guildId) {
+    return (
+        db.guilds[guildId]?.personality ||
+        defaultPersonality()
+    );
+}
+
+function setPersonality(guildId, personality) {
+    if (!db.guilds[guildId]) {
+        db.guilds[guildId] = {};
+    }
+
+    db.guilds[guildId].personality = personality;
+
+    saveData();
+}
+
+function resetPersonality(guildId) {
+    if (db.guilds[guildId]) {
+        delete db.guilds[guildId].personality;
+    }
+
+    saveData();
+}
+
+// ========================================
+// 🤖 CLIENTE DO DISCORD
 // ========================================
 
 const client = new Client({
@@ -23,117 +176,138 @@ const client = new Client({
     ]
 });
 
-const hf = new InferenceClient(process.env.HF_TOKEN);
+const hf = new InferenceClient(
+    process.env.HF_TOKEN
+);
 
 // ========================================
-// 🧠 BANCO DE DADOS
+// 🧠 IA
 // ========================================
 
-const db = new Database("carbot.db");
+async function askAI(guildId, userId, prompt) {
+    const memory = getMemory(guildId, userId);
 
-db.prepare(`
-    CREATE TABLE IF NOT EXISTS memories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-`).run();
+    const messages = [
+        {
+            role: "system",
+            content: getPersonality(guildId)
+        }
+    ];
 
-// Mantém somente as últimas 10 mensagens por usuário
-function saveMemory(userId, role, content) {
-    db.prepare(`
-        INSERT INTO memories (user_id, role, content)
-        VALUES (?, ?, ?)
-    `).run(userId, role, content);
-
-    const count = db.prepare(`
-        SELECT COUNT(*) AS count
-        FROM memories
-        WHERE user_id = ?
-    `).get(userId).count;
-
-    if (count > 10) {
-        db.prepare(`
-            DELETE FROM memories
-            WHERE user_id = ?
-            AND id NOT IN (
-                SELECT id
-                FROM memories
-                WHERE user_id = ?
-                ORDER BY id DESC
-                LIMIT 10
-            )
-        `).run(userId, userId);
+    for (const item of memory) {
+        messages.push({
+            role: item.role,
+            content: item.content
+        });
     }
-}
 
-function getMemory(userId) {
-    return db.prepare(`
-        SELECT role, content
-        FROM memories
-        WHERE user_id = ?
-        ORDER BY id ASC
-        LIMIT 10
-    `).all(userId);
-}
-
-function clearMemory(userId) {
-    db.prepare(`
-        DELETE FROM memories
-        WHERE user_id = ?
-    `).run(userId);
-}
-
-// ========================================
-// 🤖 INTELIGÊNCIA ARTIFICIAL
-// ========================================
-
-async function askAI(userId, prompt) {
-    saveMemory(userId, "user", prompt);
-
-    const memory = getMemory(userId);
-
-    const response = await hf.chatCompletion({
-        model: "openai/gpt-oss-120b:fastest",
-
-        messages: [
-            {
-                role: "system",
-                content: `
-Você é o Carbot, um bot brasileiro de Discord.
-
-Responda sempre em português, de forma amigável,
-útil e descontraída.
-
-Você pode usar emojis quando fizer sentido.
-
-Seu criador é o longhorn2004 (<@1417274590937223168>).
-`
-            },
-
-            ...memory
-        ],
-
-        max_tokens: 500,
-        temperature: 0.7
+    messages.push({
+        role: "user",
+        content: prompt
     });
 
-    const answer =
-        response.choices?.[0]?.message?.content;
+    try {
+        const response = await hf.chatCompletion({
+            model: MODEL,
+            messages,
+            max_tokens: 1000,
+            temperature: 0.7
+        });
 
-    if (!answer) {
-        throw new Error("A IA não retornou uma resposta.");
+        const answer =
+            response?.choices?.[0]?.message?.content;
+
+        if (!answer) {
+            throw new Error("HF_UNKNOWN");
+        }
+
+        // Só salva depois que a IA respondeu
+        saveMemory(
+            guildId,
+            userId,
+            "user",
+            prompt
+        );
+
+        saveMemory(
+            guildId,
+            userId,
+            "assistant",
+            answer
+        );
+
+        return answer;
+
+    } catch (error) {
+        console.error("❌ Erro Hugging Face:", error);
+
+        throw normalizeHFError(error);
     }
-
-    saveMemory(userId, "assistant", answer);
-
-    return answer;
 }
 
 // ========================================
-// ⚡ COMANDOS
+// 📦 EMBEDS
+// ========================================
+
+function createAIEmbed(content, index, total) {
+    const embed = new EmbedBuilder()
+        .setColor(0x3498db)
+        .setDescription(content)
+        .setFooter({
+            text:
+                total > 1
+                    ? `Carbot • Parte ${index}/${total}`
+                    : "Carbot"
+        })
+        .setTimestamp();
+
+    return embed;
+}
+
+async function sendAIResponse(message, answer) {
+    const chunks = splitMessage(answer, 3900);
+
+    for (let i = 0; i < chunks.length; i++) {
+        await message.channel.send({
+            embeds: [
+                createAIEmbed(
+                    chunks[i],
+                    i + 1,
+                    chunks.length
+                )
+            ]
+        });
+    }
+}
+
+async function replyAIInteraction(interaction, answer) {
+    const chunks = splitMessage(answer, 3900);
+
+    await interaction.editReply({
+        embeds: [
+            createAIEmbed(
+                chunks[0],
+                1,
+                chunks.length
+            )
+        ]
+    });
+
+    for (let i = 1; i < chunks.length; i++) {
+        await interaction.followUp({
+            embeds: [
+                createAIEmbed(
+                    chunks[i],
+                    i + 1,
+                    chunks.length
+                )
+            ]
+        });
+    }
+}
+
+// ========================================
+// 📋 SLASH COMMANDS
 // ========================================
 
 const commands = [
@@ -143,7 +317,7 @@ const commands = [
         .addStringOption(option =>
             option
                 .setName("pergunta")
-                .setDescription("O que você quer perguntar?")
+                .setDescription("Sua pergunta")
                 .setRequired(true)
         ),
 
@@ -153,19 +327,49 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("clear")
-        .setDescription("Apaga sua memória de conversa com o Carbot")
+        .setDescription("Limpa sua memória com o Carbot"),
+
+    new SlashCommandBuilder()
+        .setName("setpersonality")
+        .setDescription("Define a personalidade do Carbot neste servidor")
+        .addStringOption(option =>
+            option
+                .setName("personalidade")
+                .setDescription("Nova personalidade")
+                .setRequired(true)
+                .setMaxLength(1500)
+        )
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.Administrator
+        ),
+
+    new SlashCommandBuilder()
+        .setName("resetpersonality")
+        .setDescription("Restaura a personalidade padrão")
+        .setDefaultMemberPermissions(
+            PermissionFlagsBits.Administrator
+        ),
+
+    new SlashCommandBuilder()
+        .setName("config")
+        .setDescription("Mostra a configuração do Carbot")
 ].map(command => command.toJSON());
 
 // ========================================
-// 🚀 BOT ONLINE
+// 🟢 READY
 // ========================================
 
 client.once("ready", async () => {
+    console.log("========================================");
     console.log(`🤖 Carbot online como ${client.user.tag}`);
+    console.log(`🧠 Modelo: ${MODEL}`);
+    console.log(`💾 Banco: carbot.json`);
+    console.log("========================================");
 
     try {
-        const rest = new REST({ version: "10" })
-            .setToken(process.env.DISCORD_TOKEN);
+        const rest = new REST({
+            version: "10"
+        }).setToken(process.env.DISCORD_TOKEN);
 
         await rest.put(
             Routes.applicationCommands(client.user.id),
@@ -174,11 +378,10 @@ client.once("ready", async () => {
             }
         );
 
-        console.log("✅ Comandos slash registrados!");
-        console.log("🧠 Memória SQLite carregada!");
+        console.log("✅ Slash commands registrados!");
     } catch (error) {
         console.error(
-            "❌ Erro ao registrar comandos:",
+            "❌ Erro ao registrar slash commands:",
             error
         );
     }
@@ -191,11 +394,18 @@ client.once("ready", async () => {
 client.on("messageCreate", async message => {
     if (message.author.bot) return;
 
-    if (message.content.toLowerCase() === "ping") {
-        return message.reply("🏓 Pong!");
+    if (message.content.trim().toLowerCase() === "ping") {
+        await message.reply("🏓 Pong!");
+        return;
     }
 
-    if (!message.mentions.has(client.user)) return;
+    if (!message.mentions.has(client.user)) {
+        return;
+    }
+
+    if (!message.guild) {
+        return;
+    }
 
     const prompt = message.content
         .replace(`<@${client.user.id}>`, "")
@@ -203,26 +413,31 @@ client.on("messageCreate", async message => {
         .trim();
 
     if (!prompt) {
-        return message.reply(
-            "🤖 Fala aí! O que você quer saber?"
+        await message.reply(
+            "👋 Opa! Me pergunta alguma coisa!"
         );
+        return;
     }
 
     try {
         await message.channel.sendTyping();
 
         const answer = await askAI(
+            message.guild.id,
             message.author.id,
             prompt
         );
 
-        await message.reply(answer);
+        await sendAIResponse(
+            message,
+            answer
+        );
 
     } catch (error) {
-        console.error("❌ Erro na IA:", error);
+        console.error(error);
 
         await message.reply(
-            "❌ Deu erro ao falar com a inteligência artificial."
+            getAIErrorMessage(error)
         );
     }
 });
@@ -232,49 +447,264 @@ client.on("messageCreate", async message => {
 // ========================================
 
 client.on("interactionCreate", async interaction => {
-    if (!interaction.isChatInputCommand()) return;
+    if (!interaction.isChatInputCommand()) {
+        return;
+    }
 
+    // ------------------------------------
     // /ping
+    // ------------------------------------
+
     if (interaction.commandName === "ping") {
-        return interaction.reply("🏓 Pong!");
+        await interaction.reply("🏓 Pong!");
+        return;
     }
 
+    // ------------------------------------
     // /clear
-    if (interaction.commandName === "clear") {
-        clearMemory(interaction.user.id);
+    // ------------------------------------
 
-        return interaction.reply(
-            "🧠 Memória apagada! Começamos do zero."
+    if (interaction.commandName === "clear") {
+        if (!interaction.guild) {
+            await interaction.reply({
+                content:
+                    "❌ Esse comando só funciona em servidores.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        clearMemory(
+            interaction.guild.id,
+            interaction.user.id
         );
+
+        await interaction.reply({
+            content:
+                "🧹 Sua memória com o Carbot foi limpa!",
+            ephemeral: true
+        });
+
+        return;
     }
 
-    // /ask
-    if (interaction.commandName === "ask") {
-        const prompt =
-            interaction.options.getString("pergunta");
+    // ------------------------------------
+    // /setpersonality
+    // ------------------------------------
 
-        await interaction.deferReply();
+    if (
+        interaction.commandName ===
+        "setpersonality"
+    ) {
+        if (!interaction.guild) {
+            await interaction.reply({
+                content:
+                    "❌ Esse comando só funciona em servidores.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        if (
+            !interaction.memberPermissions?.has(
+                PermissionFlagsBits.Administrator
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "🚫 Você precisa ser administrador para fazer isso.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        const personality =
+            interaction.options.getString(
+                "personalidade",
+                true
+            );
+
+        setPersonality(
+            interaction.guild.id,
+            personality
+        );
+
+        await interaction.reply({
+            content:
+                "✅ Personalidade do Carbot atualizada neste servidor!",
+            ephemeral: true
+        });
+
+        return;
+    }
+
+    // ------------------------------------
+    // /resetpersonality
+    // ------------------------------------
+
+    if (
+        interaction.commandName ===
+        "resetpersonality"
+    ) {
+        if (!interaction.guild) {
+            await interaction.reply({
+                content:
+                    "❌ Esse comando só funciona em servidores.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        if (
+            !interaction.memberPermissions?.has(
+                PermissionFlagsBits.Administrator
+            )
+        ) {
+            await interaction.reply({
+                content:
+                    "🚫 Você precisa ser administrador para fazer isso.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        resetPersonality(
+            interaction.guild.id
+        );
+
+        await interaction.reply({
+            content:
+                "🔄 Personalidade padrão restaurada!",
+            ephemeral: true
+        });
+
+        return;
+    }
+
+    // ------------------------------------
+    // /config
+    // ------------------------------------
+
+    if (interaction.commandName === "config") {
+        if (!interaction.guild) {
+            await interaction.reply({
+                content:
+                    "❌ Esse comando só funciona em servidores.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        const customPersonality =
+            db.guilds[interaction.guild.id]
+                ?.personality;
+
+        const embed = new EmbedBuilder()
+            .setColor(0x3498db)
+            .setTitle("⚙️ Configuração do Carbot")
+            .addFields(
+                {
+                    name: "🧠 Modelo",
+                    value: `\`${MODEL}\``
+                },
+                {
+                    name: "💭 Memória",
+                    value: `${MAX_MEMORY} mensagens por usuário`
+                },
+                {
+                    name: "🎭 Personalidade",
+                    value: customPersonality
+                        ? "Personalidade personalizada"
+                        : "Personalidade padrão"
+                }
+            )
+            .setFooter({
+                text: "Carbot 1.2.1"
+            });
+
+        await interaction.reply({
+            embeds: [embed],
+            ephemeral: true
+        });
+
+        return;
+    }
+
+    // ------------------------------------
+    // /ask
+    // ------------------------------------
+
+    if (interaction.commandName === "ask") {
+        if (!interaction.guild) {
+            await interaction.reply({
+                content:
+                    "❌ Esse comando só funciona em servidores.",
+                ephemeral: true
+            });
+
+            return;
+        }
+
+        const prompt =
+            interaction.options.getString(
+                "pergunta",
+                true
+            );
 
         try {
+            await interaction.deferReply();
+
             const answer = await askAI(
+                interaction.guild.id,
                 interaction.user.id,
                 prompt
             );
 
-            await interaction.editReply(answer);
+            await replyAIInteraction(
+                interaction,
+                answer
+            );
 
         } catch (error) {
-            console.error("❌ Erro na IA:", error);
+            console.error(error);
 
             await interaction.editReply(
-                "❌ Deu erro ao falar com a inteligência artificial."
+                getAIErrorMessage(error)
             );
         }
     }
 });
 
 // ========================================
-// 🔑 LOGIN
+// 🔐 VERIFICAÇÃO
 // ========================================
 
-client.login(process.env.DISCORD_TOKEN);
+if (!process.env.DISCORD_TOKEN) {
+    console.error(
+        "❌ DISCORD_TOKEN não foi configurado!"
+    );
+
+    process.exit(1);
+}
+
+if (!process.env.HF_TOKEN) {
+    console.error(
+        "❌ HF_TOKEN não foi configurado!"
+    );
+
+    process.exit(1);
+}
+
+// ========================================
+// 🚀 LOGIN
+// ========================================
+
+client.login(
+    process.env.DISCORD_TOKEN
+);
